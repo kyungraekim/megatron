@@ -3,9 +3,6 @@ include:
 
 .pre_rules:
   rules:
-    - if: $CI_PIPELINE_SOURCE == 'main' || $CI_COMMIT_BRANCH == 'dev'
-      allow_failure: true
-      when: always
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: always
