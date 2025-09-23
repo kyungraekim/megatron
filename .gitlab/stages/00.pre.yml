@@ -3,7 +3,7 @@ include:
 
 .pre_rules:
   rules:
-    - if: $CI_PIPELINE_SOURCE == 'main'
+    - if: $CI_PIPELINE_SOURCE == 'main' || $CI_COMMIT_BRANCH == 'dev'
       allow_failure: true
       when: always
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
@@ -25,7 +25,7 @@ include:
 
 pre:mirror_to_github:
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+    - if: '($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev") && $CI_PIPELINE_SOURCE == "push"'
       allow_failure: true
     - when: never
   tags:
@@ -48,7 +48,7 @@ pre:mirror_to_github:
 
 pre:create_ci_branches:
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+    - if: '($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev") && $CI_PIPELINE_SOURCE == "push"'
       allow_failure: true
     - when: never
   parallel:
@@ -61,6 +61,14 @@ pre:create_ci_branches:
       - branch: ci-pre-release
       - branch: ci-review-reminder
       - branch: ci-upgrade-dependencies
+      - branch: ci-dev-unit-test-extended
+      - branch: ci-dev-rebuild-mcore-nemo-image
+      - branch: ci-dev-mr
+      - branch: ci-dev-nightly
+      - branch: ci-dev-weekly
+      - branch: ci-dev-pre-release
+      - branch: ci-dev-review-reminder
+      - branch: ci-dev-upgrade-dependencies
   tags:
     - arch/amd64
     - env/prod
