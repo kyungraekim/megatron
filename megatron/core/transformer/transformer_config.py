@@ -705,6 +705,13 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
+    ####################
+    # Layer embeddings
+    ####################
+    use_per_layer_embeddings: bool = False
+    hidden_size_per_layer_input: Optional[int] = None
+    padded_vocab_size: Optional[int] = None
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more

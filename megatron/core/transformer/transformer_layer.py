@@ -436,6 +436,39 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
+        if self.config.use_per_layer_embeddings:
+            import transformer_engine as te
+            from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
+            self.layer_embedding = tensor_parallel.VocabParallelEmbedding(
+                num_embeddings=config.padded_vocab_size,
+                embedding_dim=config.hidden_size_per_layer_input,
+                init_method=config.init_method,
+                config=self.config
+            )
+            self.per_layer_input_gate = TEColumnParallelLinear(
+                input_size=config.hidden_size,
+                output_size=config.hidden_size_per_layer_input,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=config.add_bias_linear,
+                skip_bias_add=True,
+                is_expert=False,
+                tp_comm_buffer_name="per_layer_input_gate",
+            )
+            self.act_fn = torch.nn.functional.silu
+            self.per_layer_projection = TERowParallelLinear(
+                input_size=config.hidden_size_per_layer_input,
+                output_size=config.hidden_size,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=config.add_bias_linear,
+                input_is_parallel=True,
+                skip_bias_add=True,
+                is_expert=False,
+                tp_comm_buffer_name="per_layer_projection",
+            )
+
     @staticmethod
     def _get_layer_offset(config: TransformerConfig):
         """
@@ -450,7 +483,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         )
         return get_transformer_layer_offset(config)
 
-    def forward(self, *args, **kwargs):
+    def forward(self, input_ids, *args, **kwargs):
         """
         Perform a forward pass through the transformer layer.
 
@@ -461,8 +494,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
+        if self.config.use_per_layer_embeddings:
+            layer_embedding = self.layer_embedding(input_ids).transpose(0, 1)
+        else:
+            layer_embedding = None
         hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+        output = self._forward_mlp(hidden_states, layer_embedding, kwargs.get("inference_context", None))
         return output, context
 
     def _forward_attention(
@@ -576,7 +613,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
-    def _forward_mlp(self, hidden_states, inference_context=None):
+    def _forward_mlp(self, hidden_states, layer_embedding, inference_context=None):
         """
         Perform a forward pass through the feed-forward layer.
 
@@ -640,6 +677,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         else:
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+
+        if self.config.use_per_layer_embeddings:
+            assert mlp_output_with_bias[1] is None, "not support mlp.bias=True"
+            output_ple, _ = self.per_layer_input_gate(mlp_output_with_bias[0])
+            output_ple = self.act_fn(output_ple).mul(layer_embedding)
+            output_ple, _ = self.per_layer_projection(output_ple)
+
+            mlp_output_with_bias = (output_ple + mlp_output_with_bias[0], None)
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute

@@ -73,6 +73,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
                 vp_stage=vp_stage,
             )
 
+        config.padded_vocab_size = args.padded_vocab_size
         model = GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
