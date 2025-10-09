@@ -115,6 +115,7 @@ def _get_transformer_layer_spec(use_te, config):
             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             qk_l2_norm=args.qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            use_per_layer_embeddings=config.use_per_layer_embeddings,
         )
     else:
         return get_gpt_layer_local_spec(
@@ -125,4 +126,5 @@ def _get_transformer_layer_spec(use_te, config):
             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             normalization=args.normalization,
             use_kitchen=config.use_kitchen,
+            use_per_layer_embeddings=config.use_per_layer_embeddings,
         )

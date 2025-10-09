@@ -6,6 +6,7 @@ from typing import Optional, Union
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
+from megatron.core.utils import is_te_min_version
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
@@ -19,6 +20,10 @@ from megatron.core.transformer.multi_token_prediction import (
     get_mtp_layer_offset,
     get_mtp_layer_spec_for_backend,
     get_mtp_num_layers_to_build,
+)
+from megatron.core.transformer.per_layer_embedding import (
+    PerLayerEmbedding,
+    PerLayerEmbeddingSubmodules,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.torch_norm import L2Norm
@@ -80,6 +85,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_te_op_fuser: Optional[bool] = False,
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
+    use_per_layer_embeddings: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -94,6 +100,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
         use_te_op_fuser (bool, optional): Use Transformer Engine's operation-based API, which may
                                           enable certain operation fusions. Defaults to False.
+        use_per_layer_embeddings (bool, optional): To use per-layer embeddings. Defaults to False.
 
     Returns:
         ModuleSpec: Module specification with TE modules
@@ -122,6 +129,12 @@ def get_gpt_layer_with_transformer_engine_spec(
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
         use_te_activation_func=use_te_activation_func,
+    )
+
+    per_layer_embedding = (
+        get_per_layer_embedding_module_spec_for_backend(backend=backend)
+        if use_per_layer_embeddings
+        else IdentityOp
     )
 
     if multi_latent_attention:
@@ -159,6 +172,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                per_layer_embedding=per_layer_embedding,
             ),
         )
     else:
@@ -185,6 +199,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                per_layer_embedding=per_layer_embedding,
                 sharded_state_dict_keys_map={
                     "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
                     "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
@@ -207,6 +222,7 @@ def get_gpt_layer_local_spec(
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
     use_kitchen: bool = False,
+    use_per_layer_embeddings: bool = False,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -219,6 +235,7 @@ def get_gpt_layer_local_spec(
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+        use_per_layer_embeddings (bool, optional): To use per-layer embeddings. Defaults to False.
 
     Returns:
         ModuleSpec: Module specification with Megatron-Core modules
@@ -250,6 +267,12 @@ def get_gpt_layer_local_spec(
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
     )
 
+    per_layer_embedding = (
+        get_per_layer_embedding_module_spec_for_backend(backend=backend)
+        if use_per_layer_embeddings
+        else IdentityOp
+    )
+
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         return ModuleSpec(
@@ -275,6 +298,7 @@ def get_gpt_layer_local_spec(
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                per_layer_embedding=per_layer_embedding,
             ),
         )
     else:
@@ -301,6 +325,7 @@ def get_gpt_layer_local_spec(
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                per_layer_embedding=per_layer_embedding,
                 sharded_state_dict_keys_map={
                     "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
                     "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
@@ -401,6 +426,26 @@ def get_mlp_module_spec_for_backend(
         )
 
 
+def get_per_layer_embedding_module_spec_for_backend(
+    backend: BackendSpecProvider,
+) -> ModuleSpec:
+    """Helper function to get module spec for per-layer embeddings.
+
+    Args:
+        backend: Backend specification provider (TE or Local)
+
+    Returns:
+        ModuleSpec: Module specification for PerLayerEmbedding
+    """
+    return ModuleSpec(
+        module=PerLayerEmbedding,
+        submodules=PerLayerEmbeddingSubmodules(
+            per_layer_input_gate=backend.column_parallel_linear(),
+            per_layer_projection=backend.row_parallel_linear(),
+        ),
+    )
+
+
 def get_gpt_decoder_block_spec(
     config: TransformerConfig,
     use_transformer_engine: bool,
@@ -421,6 +466,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            use_per_layer_embeddings=config.use_per_layer_embeddings,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -431,6 +477,7 @@ def get_gpt_decoder_block_spec(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            use_per_layer_embeddings=config.use_per_layer_embeddings,
         )
     else:
         layer_norm_impl = LNImpl
@@ -443,6 +490,7 @@ def get_gpt_decoder_block_spec(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            use_per_layer_embeddings=config.use_per_layer_embeddings,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -453,6 +501,7 @@ def get_gpt_decoder_block_spec(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            use_per_layer_embeddings=config.use_per_layer_embeddings,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
