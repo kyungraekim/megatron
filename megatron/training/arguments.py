@@ -3280,6 +3280,6 @@ def _add_sft_args(parser):
 
 def _add_ple_args(parser):
     group = parser.add_argument_group(title='Per-layer embedding features (experimental)')
-    group.add_argument('--use-per-layer-embedding', action='store_true', help='Megatron PLE training')
+    group.add_argument('--use-per-layer-embeddings', action='store_true', help='Megatron PLE training')
     group.add_argument('--hidden-size-per-layer-input', type=int, default=None, help='ple-down-proj-size')
     return parser

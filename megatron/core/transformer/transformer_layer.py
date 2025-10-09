@@ -267,8 +267,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        vocab_size: Optional[int] = None,
     ):
         super().__init__(config=config)
+
+        self.vocab_size = vocab_size
 
         # Enable cuda graphs.
         if (
@@ -404,6 +407,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
+        self.recompute_per_layer_emb = False
         if self.config.recompute_granularity == 'selective':
             if "layernorm" in self.config.recompute_modules:
                 if (
@@ -427,6 +431,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             if "mlp" in self.config.recompute_modules:
                 if not isinstance(self.mlp, MoELayer):
                     self.recompute_mlp = True
+            if "per_layer_emb" in self.config.recompute_modules:
+                if self.config.use_per_layer_embeddings:
+                    self.recompute_per_layer_emb = True
 
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
@@ -439,8 +446,16 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         if self.config.use_per_layer_embeddings:
             import transformer_engine as te
             from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
+
+            # Validate vocab_size is provided when using per-layer embeddings
+            if self.vocab_size is None:
+                raise ValueError(
+                    "vocab_size must be provided to TransformerLayer when "
+                    "use_per_layer_embeddings is True"
+                )
+
             self.layer_embedding = tensor_parallel.VocabParallelEmbedding(
-                num_embeddings=config.padded_vocab_size,
+                num_embeddings=self.vocab_size,
                 embedding_dim=config.hidden_size_per_layer_input,
                 init_method=config.init_method,
                 config=self.config
@@ -456,7 +471,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 is_expert=False,
                 tp_comm_buffer_name="per_layer_input_gate",
             )
-            self.act_fn = torch.nn.functional.silu
+            # Use the activation function from config
+            self.per_layer_act_fn = self.config.activation_func
             self.per_layer_projection = TERowParallelLinear(
                 input_size=config.hidden_size_per_layer_input,
                 output_size=config.hidden_size,
@@ -613,6 +629,22 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
+    def _apply_per_layer_embedding(self, mlp_output, layer_embedding):
+        """
+        Apply per-layer embedding operations.
+
+        Args:
+            mlp_output (Tensor): Output from the MLP layer (no bias).
+            layer_embedding (Tensor): Layer-specific embedding tensor.
+
+        Returns:
+            Tensor: Transformed output with per-layer embedding applied.
+        """
+        output_ple, _ = self.per_layer_input_gate(mlp_output)
+        output_ple = self.per_layer_act_fn(output_ple).mul(layer_embedding)
+        output_ple, _ = self.per_layer_projection(output_ple)
+        return output_ple + mlp_output
+
     def _forward_mlp(self, hidden_states, layer_embedding, inference_context=None):
         """
         Perform a forward pass through the feed-forward layer.
@@ -679,12 +711,31 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
         if self.config.use_per_layer_embeddings:
-            assert mlp_output_with_bias[1] is None, "not support mlp.bias=True"
-            output_ple, _ = self.per_layer_input_gate(mlp_output_with_bias[0])
-            output_ple = self.act_fn(output_ple).mul(layer_embedding)
-            output_ple, _ = self.per_layer_projection(output_ple)
+            if self.recompute_per_layer_emb:
+                # Recompute per-layer embedding operations during backward pass
+                if self.config.fp8:
+                    # import here to avoid circular import
+                    from megatron.core.extensions.transformer_engine import te_checkpoint
 
-            mlp_output_with_bias = (output_ple + mlp_output_with_bias[0], None)
+                    per_layer_output = te_checkpoint(
+                        self._apply_per_layer_embedding,
+                        False,
+                        tensor_parallel.random.get_cuda_rng_tracker,
+                        self.pg_collection.tp,
+                        mlp_output_with_bias[0],
+                        layer_embedding,
+                    )
+                else:
+                    per_layer_output = tensor_parallel.checkpoint(
+                        self._apply_per_layer_embedding, False, mlp_output_with_bias[0], layer_embedding
+                    )
+                mlp_output_with_bias = (per_layer_output, None)
+            else:
+                output_ple, _ = self.per_layer_input_gate(mlp_output_with_bias[0])
+                output_ple = self.per_layer_act_fn(output_ple).mul(layer_embedding)
+                output_ple, _ = self.per_layer_projection(output_ple)
+
+                mlp_output_with_bias = (output_ple + mlp_output_with_bias[0], None)
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute

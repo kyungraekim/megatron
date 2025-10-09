@@ -322,7 +322,7 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts".
+    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts", "per_layer_emb".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -331,8 +331,9 @@ class TransformerConfig(ModelParallelConfig):
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
+    "per_layer_emb": recompute the per-layer embedding operations (gate, activation, projection).
     "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "core_attn", "mlp", "moe", "shared_experts", and "per_layer_emb" use normal checkpointing.
     """
 
     ####################
@@ -710,7 +711,6 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     use_per_layer_embeddings: bool = False
     hidden_size_per_layer_input: Optional[int] = None
-    padded_vocab_size: Optional[int] = None
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -940,6 +940,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "per_layer_emb",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -986,6 +987,13 @@ class TransformerConfig(ModelParallelConfig):
                         raise ValueError(
                             "moe_act and layernorm recompute for fp8 needs "
                             "transformer-engine>=2.6.0dev0, "
+                            f"but your version is {get_te_version()}."
+                        )
+                if "per_layer_emb" in self.recompute_modules and self.use_per_layer_embeddings:
+                    # Per-layer embeddings use TE linear layers, which require TE for FP8 support
+                    if not is_te_min_version("1.0.0"):
+                        raise ValueError(
+                            "per_layer_emb recompute with FP8 requires transformer-engine>=1.0.0, "
                             f"but your version is {get_te_version()}."
                         )
 
@@ -1488,6 +1496,22 @@ class TransformerConfig(ModelParallelConfig):
                 assert len(self.no_rope_freq) == self.num_layers, (
                     f"Length of no_rope list ({len(self.no_rope_freq)}) must match "
                     f"the number of layers ({self.num_layers})"
+                )
+
+        # Per-layer embedding validation
+        if self.use_per_layer_embeddings:
+            if self.hidden_size_per_layer_input is None:
+                raise ValueError(
+                    "hidden_size_per_layer_input must be specified when use_per_layer_embeddings is True."
+                )
+            if self.hidden_size_per_layer_input <= 0:
+                raise ValueError(
+                    f"hidden_size_per_layer_input must be positive, got {self.hidden_size_per_layer_input}."
+                )
+            if self.add_bias_linear:
+                raise ValueError(
+                    "Per-layer embeddings do not support bias in MLP. "
+                    "Please set add_bias_linear=False when using per-layer embeddings."
                 )
 
 

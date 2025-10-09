@@ -185,6 +185,7 @@ class GPTModel(LanguageModule):
             post_process=self.post_process,
             pg_collection=self.pg_collection,
             vp_stage=vp_stage,
+            vocab_size=self.vocab_size,
         )
 
         if self.mtp_process:

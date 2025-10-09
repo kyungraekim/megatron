@@ -275,8 +275,11 @@ class TransformerBlock(MegatronModule):
         post_process: bool = True,
         pg_collection: ProcessGroupCollection = None,
         vp_stage: Optional[int] = None,
+        vocab_size: Optional[int] = None,
     ):
         super().__init__(config=config)
+
+        self.vocab_size = vocab_size
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -359,6 +362,7 @@ class TransformerBlock(MegatronModule):
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
+                    vocab_size=self.vocab_size,
                 )
             return module
 
