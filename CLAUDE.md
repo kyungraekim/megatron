@@ -1281,6 +1281,7 @@ pylint megatron/core/
 - **Issues**: https://github.com/NVIDIA/Megatron-LM/issues
 - **Changelog**: `/CHANGELOG.md`
 - **Contributing**: `/CONTRIBUTING.md`
+- **MoE Training Guide**: `/MOE_TRAINING_GUIDE.md` - Comprehensive guide for implementing and training Mixture of Experts models with GPU efficiency optimizations
 
 ### Related Projects
 
@@ -1338,8 +1339,9 @@ pylint megatron/core/
 1. **Check similar existing implementations** in the codebase
 2. **Read the tests** to understand expected behavior
 3. **Look at `examples/`** for usage patterns
-4. **Ask for clarification** via GitHub issues
-5. **Propose design first** for large changes
+4. **Consult specialized guides** (e.g., `MOE_TRAINING_GUIDE.md` for MoE models)
+5. **Ask for clarification** via GitHub issues
+6. **Propose design first** for large changes
 
 ---
 
