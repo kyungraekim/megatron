@@ -743,8 +743,8 @@ Experts: 8
 TP: 1, PP: 4, EP: 8, DP: 2
 
 # Layout
-- 8 pipeline stages (PP=4 means 4 stages, each with 16 GPUs)
-- Within each stage: 8 expert parallel ranks, 2 data parallel replicas
+- 4 pipeline stages (PP=4)
+- Within each stage: 8 expert parallel ranks, 2 data parallel replicas (16 GPUs per stage)
 - No tensor parallelism (small enough to fit)
 
 PARALLEL_ARGS=(
