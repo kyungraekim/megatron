@@ -400,16 +400,28 @@ class LoopLMModel(GPTModel):
                         cumulative_exit_prob = cumulative_exit_prob + exit_prob
 
                     # Check exit condition: Q(X^(t)) > λ and t >= τ
-                    if (step >= self.config.exit_gate_min_steps and
-                        cumulative_exit_prob.mean() > self.config.exit_gate_threshold):
-                        # Early exit: compute logits and return
-                        return self._postprocess(
-                            hidden_states=hidden_states,
-                            input_ids=input_ids,
-                            position_ids=position_ids,
-                            labels=None,
-                            **kwargs
-                        )
+                    # Per-token exit decisions: each token exits independently
+                    # exit_prob shape: [seq_len, batch_size]
+                    if step >= self.config.exit_gate_min_steps:
+                        # Check which tokens should exit: [seq_len, batch_size]
+                        should_exit = cumulative_exit_prob > self.config.exit_gate_threshold
+
+                        # For simplicity: exit when all tokens across all sequences exceed threshold
+                        # More sophisticated: track per-token exit states and mask computation
+                        if should_exit.all():
+                            # Early exit: compute logits and return
+                            return self._postprocess(
+                                hidden_states=hidden_states,
+                                input_ids=input_ids,
+                                position_ids=position_ids,
+                                labels=None,
+                                **kwargs
+                            )
+
+                        # Note: For true per-token adaptive computation, implement:
+                        # 1. Exit mask tracking per token: exit_mask[seq_len, batch_size]
+                        # 2. Masked computation: only process non-exited tokens
+                        # 3. Gather final hidden states from different exit depths
 
             # Prepare input for next recurrent step
             decoder_input = hidden_states
@@ -518,16 +530,16 @@ class ExitGate(MegatronModule):
             temperature: Temperature for Gumbel-Softmax (training only)
 
         Returns:
-            exit_prob: [batch_size] - probability of exiting at this step
+            exit_prob: [seq_len, batch_size] - per-token probability of exiting at this step
         """
-        # Pool hidden states (mean over sequence)
-        # [seq_len, batch_size, hidden_size] → [batch_size, hidden_size]
-        pooled = hidden_states.mean(dim=0)
+        # Apply gate network to each token independently
+        # [seq_len, batch_size, hidden_size] → [seq_len, batch_size, 1]
+        gate_logit = self.gate_network(hidden_states)
 
-        # Compute gate logit
-        gate_logit = self.gate_network(pooled).squeeze(-1)  # [batch_size]
+        # Remove last dimension: [seq_len, batch_size, 1] → [seq_len, batch_size]
+        gate_logit = gate_logit.squeeze(-1)
 
-        # Add step-specific bias
+        # Add step-specific bias (broadcast across seq_len and batch_size)
         gate_logit = gate_logit + self.step_bias[step]
 
         # During training: return raw logit (will be normalized later)
@@ -686,7 +698,12 @@ class LoopLMLoss:
                 num_tokens = labels.numel()
 
             # Average over sequence, keep batch dimension
-            loss_per_sample = loss_per_token.sum(dim=0) / (loss_mask.sum(dim=0) if loss_mask is not None else labels.size(0))
+            # Add numerical stability: avoid division by zero for fully-padded samples
+            if loss_mask is not None:
+                denominator = loss_mask.sum(dim=0).clamp(min=1.0)  # Prevent division by zero
+                loss_per_sample = loss_per_token.sum(dim=0) / denominator
+            else:
+                loss_per_sample = loss_per_token.sum(dim=0) / labels.size(0)
             losses_per_step.append(loss_per_sample)
 
         # Stack losses: [batch_size, num_steps]
@@ -1135,7 +1152,7 @@ def forward_step(data_iterator, model: LoopLMMoEModel):
     return total_loss, lambda: (total_loss, num_tokens, logging_dict)
 
 
-def train_step_with_router_warmup(iteration, model, optimizer, ...):
+def train_step_with_router_warmup(iteration, model, optimizer, *args, **kwargs):
     """Training step with router warmup strategy.
 
     Problem: MoE models suffer from load imbalance in first ~200 steps
@@ -1245,8 +1262,8 @@ pip install nv-grouped-gemm~=1.1
 
 ```bash
 # Selective recomputation (recommended)
---recompute-activations
---recompute-granularity selective
+--recompute-activations \
+--recompute-granularity selective \
 --recompute-modules moe shared_experts moe_act layernorm
 
 # CRITICAL for LoopLM: Recompute across recurrent steps
@@ -1324,7 +1341,7 @@ With overlap:
 class PipelinedLoopLMMoE(LoopLMMoEModel):
     """Pipeline recurrent steps to overlap communication and computation."""
 
-    def forward(self, ...):
+    def forward(self, *args, **kwargs):
         # Step 0: Compute routing for step 1 (no expert compute yet)
         router_output_next = self.router(hidden_states)
 
@@ -2543,7 +2560,7 @@ if __name__ == "__main__":
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
-        ModelType.encoder_or_decoder,
+        ModelType.decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
         extra_args_provider=add_looplm_args
@@ -2694,7 +2711,7 @@ TRAINING_ARGS=(
 # Memory optimizations
 MEMORY_ARGS=(
     --recompute-granularity selective
-    --recompute-modules moe,core_attn
+    --recompute-modules moe core_attn
     --moe-expert-capacity-factor 1.0  # For first 200 steps
 )
 
