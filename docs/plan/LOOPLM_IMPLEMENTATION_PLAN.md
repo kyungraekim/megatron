@@ -1348,9 +1348,18 @@ With overlap:
 class PipelinedLoopLMMoE(LoopLMMoEModel):
     """Pipeline recurrent steps to overlap communication and computation."""
 
-    def forward(self, *args, **kwargs):
+    def forward(self, hidden_states, attention_mask=None, **kwargs):
+        """Forward pass with pipelined recurrent steps.
+
+        Args:
+            hidden_states: Input tensor [seq_len, batch_size, hidden_size]
+            attention_mask: Optional attention mask
+            **kwargs: Additional arguments
+        """
         # Step 0: Compute routing for step 1 (no expert compute yet)
-        router_output_next = self.router(hidden_states)
+        # Use attention output as proxy for next hidden state
+        attn_output = self.attention_layer(hidden_states, attention_mask)
+        router_output_next = self.router(attn_output)
 
         for step in range(self.recurrent_depth):
             # Use routing from previous iteration
@@ -1361,9 +1370,10 @@ class PipelinedLoopLMMoE(LoopLMMoEModel):
 
             # While AlltoAll is in flight, compute routing for NEXT step
             if step < self.recurrent_depth - 1:
-                # Peek ahead: compute routing for next step
-                hidden_states_peek = self.attention(hidden_states)  # Fast path
-                router_output_next = self.router(hidden_states_peek)
+                # Peek ahead: Apply attention to current hidden states
+                # to approximate next step's hidden states for routing
+                attn_output = self.attention_layer(hidden_states, attention_mask)
+                router_output_next = self.router(attn_output)
 
             # Wait for AlltoAll to complete
             expert_input = a2a_handle.wait()
@@ -1645,12 +1655,12 @@ Component                          | Memory per Step | Total (T=4) | With Optimi
 Model Parameters (shared)          | 8GB             | 8GB         | 8GB
 Optimizer States (AdamW)           | 16GB            | 16GB        | 16GB
 Activations (forward)              | 10GB            | 40GB        | 12GB (recompute)
-MoE Expert Buffers                 | 4GB             | 16GB        | 8GB (reuse buffers)
+MoE Expert Buffers                 | 4GB             | 16GB        | 4GB (reuse buffers, 75% reduction)
 Router States                      | 0.5GB           | 2GB         | 0.5GB (reuse)
 Exit Gate States                   | 0.1GB           | 0.4GB       | 0.1GB (reuse)
 Gradients                          | 8GB             | 8GB         | 8GB (accumulated)
 -----------------------------------|-----------------|-------------|------------------
-TOTAL                              | -               | 90.4GB      | 58.6GB (35% reduction)
+TOTAL                              | -               | 90.4GB      | 54.6GB (40% reduction)
 ```
 
 #### Advanced Memory Optimizations
@@ -2006,7 +2016,7 @@ PARALLEL_ARGS=(
     --tensor-model-parallel-size 4
     --pipeline-model-parallel-size 8
     --expert-model-parallel-size 8
-    --context-parallel-size 2               # For long context
+    --context-parallel-size 1               # Adjusted: 4×8×8×1 = 256 GPUs
     --num-layers-per-virtual-pipeline-stage 2
     --sequence-parallel
     --use-distributed-optimizer
