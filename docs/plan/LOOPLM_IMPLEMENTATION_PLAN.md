@@ -400,14 +400,13 @@ class LoopLMModel(GPTModel):
                         cumulative_exit_prob = cumulative_exit_prob + exit_prob
 
                     # Check exit condition: Q(X^(t)) > λ and t >= τ
-                    # Per-token exit decisions: each token exits independently
-                    # exit_prob shape: [seq_len, batch_size]
+                    # Per-sequence exit decisions: each sequence can exit independently
+                    # exit_prob shape: [batch_size]
                     if step >= self.config.exit_gate_min_steps:
-                        # Check which tokens should exit: [seq_len, batch_size]
+                        # Check which sequences should exit: [batch_size]
                         should_exit = cumulative_exit_prob > self.config.exit_gate_threshold
 
-                        # For simplicity: exit when all tokens across all sequences exceed threshold
-                        # More sophisticated: track per-token exit states and mask computation
+                        # If all sequences in batch have decided to exit, return early
                         if should_exit.all():
                             # Early exit: compute logits and return
                             return self._postprocess(
@@ -418,10 +417,10 @@ class LoopLMModel(GPTModel):
                                 **kwargs
                             )
 
-                        # Note: For true per-token adaptive computation, implement:
-                        # 1. Exit mask tracking per token: exit_mask[seq_len, batch_size]
-                        # 2. Masked computation: only process non-exited tokens
-                        # 3. Gather final hidden states from different exit depths
+                        # Note: For partial batch exits (some sequences exit, others continue):
+                        # 1. Track exit_mask per sequence: exit_mask[batch_size]
+                        # 2. Only compute recurrent steps for non-exited sequences
+                        # 3. Gather final hidden states from different exit depths per sequence
 
             # Prepare input for next recurrent step
             decoder_input = hidden_states
@@ -530,16 +529,24 @@ class ExitGate(MegatronModule):
             temperature: Temperature for Gumbel-Softmax (training only)
 
         Returns:
-            exit_prob: [seq_len, batch_size] - per-token probability of exiting at this step
+            exit_prob: [batch_size] - per-sequence probability of exiting at this step
         """
-        # Apply gate network to each token independently
-        # [seq_len, batch_size, hidden_size] → [seq_len, batch_size, 1]
-        gate_logit = self.gate_network(hidden_states)
+        # Aggregate hidden states over sequence dimension
+        # For decoder-only models: use last token (has most context)
+        # [seq_len, batch_size, hidden_size] → [batch_size, hidden_size]
+        pooled = hidden_states[-1, :, :]  # Last token along sequence dimension
 
-        # Remove last dimension: [seq_len, batch_size, 1] → [seq_len, batch_size]
+        # Alternative pooling strategies (commented):
+        # pooled = hidden_states.mean(dim=0)  # Mean pooling
+        # pooled = hidden_states.max(dim=0)[0]  # Max pooling
+
+        # Compute gate logit: [batch_size, hidden_size] → [batch_size, 1]
+        gate_logit = self.gate_network(pooled)
+
+        # Remove last dimension: [batch_size, 1] → [batch_size]
         gate_logit = gate_logit.squeeze(-1)
 
-        # Add step-specific bias (broadcast across seq_len and batch_size)
+        # Add step-specific bias
         gate_logit = gate_logit + self.step_bias[step]
 
         # During training: return raw logit (will be normalized later)
