@@ -260,7 +260,18 @@ def forward_step_calc_loss(
     # Set the loss scale for the auxiliary loss of the MoE layer.
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
-    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+    needs_aux_loss_scaler = (
+        (hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None)
+        or (
+            hasattr(config, 'embedding_mixer_latent_size')
+            and config.embedding_mixer_latent_size is not None
+            and (
+                getattr(config, 'embedding_mixer_aux_loss_coeff', 0.0) > 0
+                or getattr(config, 'embedding_mixer_z_loss_coeff', None) is not None
+            )
+        )
+    )
+    if needs_aux_loss_scaler:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         loss_scale = (
             config.grad_scale_func(torch.ones(1, device=output_tensor.device))

@@ -1721,6 +1721,32 @@ def training_log(
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
         )
+    if (
+        getattr(args, 'embedding_mixer_latent_size', None) is not None
+        and (
+            getattr(args, 'embedding_mixer_aux_loss_coeff', 0.0) > 0
+            or getattr(args, 'embedding_mixer_z_loss_coeff', None) is not None
+        )
+    ):
+        emb_mixer_track_names = []
+        if getattr(args, 'embedding_mixer_aux_loss_coeff', 0.0) > 0:
+            emb_mixer_track_names.append("emb_mixer_load_balance_loss")
+        if getattr(args, 'embedding_mixer_z_loss_coeff', None) is not None:
+            emb_mixer_track_names.append("emb_mixer_z_loss")
+
+        track_moe_metrics(
+            loss_scale=1 / get_num_microbatches(),
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            total_loss_dict=total_loss_dict,
+            per_layer_logging=False,
+            force_initialize=True,
+            track_names=emb_mixer_track_names,
+            num_layers=args.num_layers,
+            moe_layer_freq=getattr(args, 'embedding_mixer_layer_freq', 1),
+            mtp_num_layers=getattr(args, 'mtp_num_layers', None),
+        )
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(

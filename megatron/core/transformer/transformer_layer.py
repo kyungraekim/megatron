@@ -216,6 +216,11 @@ class TransformerLayerSubmodules:
         mlp (Union[ModuleSpec, type]): Specification for the MLP in Dense layer.
         mlp_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after the MLP.
+        pre_emb_mixer_layernorm (Union[ModuleSpec, type]): Specification for the layer normalization
+            before the embedding mixer.
+        embedding_mixer (Union[ModuleSpec, type]): Specification for the embedding mixer module.
+        emb_mixer_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
+            after the embedding mixer.
         sharded_state_dict_keys_map (Dict[str, str]): Mapping for sharded tensor keys to be applied
             in the `sharded_state_dict` method.
     """
@@ -231,6 +236,10 @@ class TransformerLayerSubmodules:
     pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
     mlp: Union[ModuleSpec, type] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
+
+    pre_emb_mixer_layernorm: Union[ModuleSpec, type] = IdentityOp
+    embedding_mixer: Union[ModuleSpec, type] = IdentityOp
+    emb_mixer_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
@@ -373,6 +382,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
 
+        # [Module 10: Pre-Embedding-Mixer Layernorm]
+        self.pre_emb_mixer_layernorm = build_module(
+            submodules.pre_emb_mixer_layernorm,
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
+
+        # [Module 11: Embedding Mixer]
+        self.embedding_mixer = build_module(
+            submodules.embedding_mixer,
+            config=self.config,
+            layer_number=self.layer_number,
+        )
+
+        # [Module 12: Embedding Mixer BiasDropoutFusion]
+        self.emb_mixer_bda = build_module(submodules.emb_mixer_bda)
+
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
 
         self.recompute_input_layernorm = False
@@ -478,8 +505,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
-        return output, context
+        hidden_states = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
+        hidden_states = self._forward_embedding_mixer(hidden_states)
+        return hidden_states, context
 
     def _forward_attention(
         self,
@@ -748,6 +776,43 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # won't result in memory savings (like the data loader, or
         # p2p_communication), it serves to document the origin of this
         # 'view' tensor.
+        output = make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+
+        return output
+
+    def _forward_embedding_mixer(self, hidden_states: Tensor) -> Tensor:
+        """
+        Perform a forward pass through the embedding mixer layer.
+
+        Args:
+            hidden_states (Tensor): Transformed hidden states before the embedding mixer layernorm.
+
+        Returns:
+            output (Tensor): Transformed hidden states of shape [s, b, h].
+        """
+
+        # Residual connection.
+        residual = hidden_states
+
+        # Optional Layer norm before embedding mixer
+        pre_emb_mixer_layernorm_output = self.pre_emb_mixer_layernorm(hidden_states)
+
+        # Embedding mixer
+        nvtx_range_push(suffix="embedding_mixer")
+        mixer_output_with_bias = self.embedding_mixer(pre_emb_mixer_layernorm_output)
+        nvtx_range_pop(suffix="embedding_mixer")
+
+        # Bias-dropout-add for embedding mixer
+        nvtx_range_push(suffix="emb_mixer_bda")
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self.emb_mixer_bda(self.training, self.config.bias_dropout_fusion)(
+                mixer_output_with_bias, residual, self.hidden_dropout
+            )
+        nvtx_range_pop(suffix="emb_mixer_bda")
+
+        # Make viewless tensor for checkpoint compatibility
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )

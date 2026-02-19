@@ -639,6 +639,33 @@ class TransformerConfig(ModelParallelConfig):
     """Number of SMs to use for HybridEP. In pure NVL scenarios,
     16 SMs can generally achieve good bandwidth."""
 
+    ####################
+    # Embedding Mixer
+    ####################
+    embedding_mixer_latent_size: Optional[int] = None
+    """Latent (down-projection) dimension for the embedding mixer module.
+    None disables the embedding mixer. When set, the embedding mixer runs as
+    an additional residual block (4th sub-block) in each transformer layer."""
+
+    embedding_mixer_num_embeddings: int = 64
+    """Size of the learned embedding table (number of selectable embeddings)."""
+
+    embedding_mixer_topk: int = 2
+    """Number of top-k embeddings selected per token during soft routing."""
+
+    embedding_mixer_layer_freq: Union[int, List[int]] = 1
+    """Frequency at which the embedding mixer appears.
+    - int: every N layers (1 = every layer, 2 = every other layer).
+    - List[int]: per-layer pattern (1 = has mixer, 0 = no mixer)."""
+
+    embedding_mixer_aux_loss_coeff: float = 0.0
+    """Scaling coefficient for embedding mixer load-balance aux loss.
+    A value of 1e-2 is a good starting point. 0.0 disables the loss."""
+
+    embedding_mixer_z_loss_coeff: Optional[float] = None
+    """Scaling coefficient for embedding mixer z-loss (logit stability).
+    A value of 1e-3 is a good starting point. None disables the loss."""
+
     ##################
     # Context Parallel
     ##################
@@ -976,6 +1003,14 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_expert_capacity_factor is None:
                 raise ValueError(
                     "moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity"
+                )
+
+        # Embedding Mixer validation
+        if self.embedding_mixer_latent_size is not None:
+            if self.embedding_mixer_topk > self.embedding_mixer_num_embeddings:
+                raise ValueError(
+                    f"embedding_mixer_topk ({self.embedding_mixer_topk}) cannot exceed "
+                    f"embedding_mixer_num_embeddings ({self.embedding_mixer_num_embeddings})"
                 )
 
         if self.cpu_offloading and (

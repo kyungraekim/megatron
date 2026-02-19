@@ -11,9 +11,11 @@ from megatron.core.models.backends import (
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.embedding_mixer import EmbeddingMixer, EmbeddingMixerSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
-from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules,
@@ -75,6 +77,28 @@ except ImportError:
     HAVE_APEX = False
 
 
+def _get_embedding_mixer_spec(config, backend: BackendSpecProvider) -> Union[ModuleSpec, type]:
+    """Get EmbeddingMixer spec if configured, else IdentityOp.
+
+    Args:
+        config: TransformerConfig instance
+        backend: BackendSpecProvider instance
+
+    Returns:
+        ModuleSpec for EmbeddingMixer if embedding_mixer_latent_size is set, else IdentityOp
+    """
+    if config.embedding_mixer_latent_size is None:
+        return IdentityOp
+
+    return ModuleSpec(
+        module=EmbeddingMixer,
+        submodules=EmbeddingMixerSubmodules(
+            down_proj=backend.column_parallel_linear(),
+            up_proj=backend.row_parallel_linear(),
+        ),
+    )
+
+
 def get_gpt_layer_with_inference_spec(
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
@@ -133,6 +157,9 @@ def get_gpt_layer_with_inference_spec(
                 pre_mlp_layernorm=IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                pre_emb_mixer_layernorm=IdentityOp,
+                embedding_mixer=IdentityOp,
+                emb_mixer_bda=IdentityFuncOp,
             ),
         )
     else:
@@ -159,6 +186,9 @@ def get_gpt_layer_with_inference_spec(
                 pre_mlp_layernorm=IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                pre_emb_mixer_layernorm=IdentityOp,
+                embedding_mixer=IdentityOp,
+                emb_mixer_bda=IdentityFuncOp,
                 sharded_state_dict_keys_map={
                     "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
                     "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
@@ -267,6 +297,9 @@ def get_gpt_layer_with_transformer_engine_spec(
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                pre_emb_mixer_layernorm=IdentityOp,
+                embedding_mixer=IdentityOp,
+                emb_mixer_bda=IdentityFuncOp,
             ),
         )
     else:
@@ -293,6 +326,9 @@ def get_gpt_layer_with_transformer_engine_spec(
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                pre_emb_mixer_layernorm=IdentityOp,
+                embedding_mixer=IdentityOp,
+                emb_mixer_bda=IdentityFuncOp,
                 sharded_state_dict_keys_map={
                     "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
                     "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
@@ -389,6 +425,9 @@ def get_gpt_layer_local_spec(
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                pre_emb_mixer_layernorm=IdentityOp,
+                embedding_mixer=IdentityOp,
+                emb_mixer_bda=IdentityFuncOp,
             ),
         )
     else:
@@ -415,6 +454,9 @@ def get_gpt_layer_local_spec(
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                pre_emb_mixer_layernorm=IdentityOp,
+                embedding_mixer=IdentityOp,
+                emb_mixer_bda=IdentityFuncOp,
                 sharded_state_dict_keys_map={
                     "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
                     "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
