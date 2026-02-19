@@ -7,12 +7,13 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from megatron.core import parallel_state
 from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler, save_to_aux_losses_tracker
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_tensor_model_parallel_group_if_none
+from megatron.core.utils import divide, get_tensor_model_parallel_group_if_none
 
 
 @dataclass
@@ -79,10 +80,10 @@ class EmbeddingMixer(MegatronModule):
                 "embedding_mixer_latent_size must not be None when creating an EmbeddingMixer"
             )
 
-        if topk > num_embeddings:
-            raise ValueError(
-                f"embedding_mixer_topk ({topk}) cannot exceed embedding_mixer_num_embeddings ({num_embeddings})"
-            )
+        # Compute TP-local latent size so the embedding table matches
+        # down_proj output (which uses gather_output=False).
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        latent_size_per_partition = divide(latent_size, tp_size)
 
         # Build down-projection layer (hidden_size → latent_size)
         self.down_proj = build_module(
@@ -102,8 +103,8 @@ class EmbeddingMixer(MegatronModule):
         if config.init_method is not None:
             config.init_method(self.gate.weight)
 
-        # Learned embedding table (not TP-sharded)
-        self.embedding_table = nn.Embedding(num_embeddings, latent_size)
+        # Learned embedding table — partitioned to match down_proj output per TP rank
+        self.embedding_table = nn.Embedding(num_embeddings, latent_size_per_partition)
         if config.init_method is not None:
             config.init_method(self.embedding_table.weight)
 
@@ -164,14 +165,16 @@ class EmbeddingMixer(MegatronModule):
         # Full softmax over all E embeddings (needed for aux loss P_i)
         router_probs = torch.softmax(gate_logits, dim=-1)  # [s*b, E]
 
+        # Compute top-k indices once (on detached logits) and reuse everywhere
+        topk_indices = torch.topk(gate_logits.detach(), k=topk, dim=-1).indices  # [s*b, topk]
+
         # ── Load-balance aux loss ────────────────────────────────────────────────
         aux_loss_coeff = self.config.embedding_mixer_aux_loss_coeff
         if self.training and aux_loss_coeff > 0:
             total_tokens = s * b
 
             # routing_map: one-hot [s*b, E] indicating which embeddings are selected
-            topk_indices_for_map = torch.topk(gate_logits.detach(), k=topk, dim=-1).indices
-            routing_map = torch.zeros_like(router_probs).scatter_(1, topk_indices_for_map, 1.0)
+            routing_map = torch.zeros_like(router_probs).scatter_(1, topk_indices, 1.0)
 
             # switch_load_balancing_loss_func formula:
             #   loss = coeff * E * sum(aggregated_probs * tokens_per_embedding)
@@ -195,8 +198,7 @@ class EmbeddingMixer(MegatronModule):
             router_probs = MoEAuxLossAutoScaler.apply(router_probs, aux_loss)
 
         # ── Top-k routing ────────────────────────────────────────────────────────
-        topk_values = router_probs.gather(1, torch.topk(gate_logits.detach(), k=topk, dim=-1).indices)
-        topk_indices = torch.topk(gate_logits.detach(), k=topk, dim=-1).indices
+        topk_values = router_probs.gather(1, topk_indices)
         mixture_weights = torch.softmax(topk_values, dim=-1)  # [s*b, topk]
 
         # Gather embeddings for selected indices

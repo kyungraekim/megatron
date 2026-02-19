@@ -42,7 +42,13 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         else:
             use_te = args.transformer_impl == "transformer_engine"
 
-            if args.num_experts:
+            # Determine whether we need the block spec path for embedding mixer layer_freq.
+            _emb_mixer_enabled = config.embedding_mixer_latent_size is not None
+            _emb_mixer_needs_block_spec = _emb_mixer_enabled and (
+                config.embedding_mixer_layer_freq != 1
+            )
+
+            if args.num_experts or _emb_mixer_needs_block_spec:
                 assert not (config.transformer_impl == "inference_optimized")
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
@@ -122,12 +128,14 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            config=config,
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
             args.qk_layernorm,
             args.multi_latent_attention,
             qk_l2_norm=args.qk_l2_norm,
+            config=config,
         )
     else:
         return get_gpt_layer_local_spec(
@@ -140,4 +148,5 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            config=config,
         )

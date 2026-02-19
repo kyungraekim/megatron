@@ -103,6 +103,7 @@ def get_gpt_layer_with_inference_spec(
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
+    config: Optional['TransformerConfig'] = None,
 ) -> ModuleSpec:
     """Use this spec to use inference optimized linear layers.
     Args:
@@ -121,6 +122,11 @@ def get_gpt_layer_with_inference_spec(
         use_te_op_fuser=False,
         use_te_activation_func=False,
     )
+
+    # Resolve embedding mixer spec from config (if provided and enabled).
+    emb_mixer_spec = _get_embedding_mixer_spec(config, backend) if config else IdentityOp
+    pre_emb_mixer_ln = backend.layer_norm() if isinstance(emb_mixer_spec, ModuleSpec) else IdentityOp
+    emb_mixer_bda_spec = get_bias_dropout_add if isinstance(emb_mixer_spec, ModuleSpec) else IdentityFuncOp
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
@@ -157,9 +163,9 @@ def get_gpt_layer_with_inference_spec(
                 pre_mlp_layernorm=IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
-                pre_emb_mixer_layernorm=IdentityOp,
-                embedding_mixer=IdentityOp,
-                emb_mixer_bda=IdentityFuncOp,
+                pre_emb_mixer_layernorm=pre_emb_mixer_ln,
+                embedding_mixer=emb_mixer_spec,
+                emb_mixer_bda=emb_mixer_bda_spec,
             ),
         )
     else:
@@ -186,9 +192,9 @@ def get_gpt_layer_with_inference_spec(
                 pre_mlp_layernorm=IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
-                pre_emb_mixer_layernorm=IdentityOp,
-                embedding_mixer=IdentityOp,
-                emb_mixer_bda=IdentityFuncOp,
+                pre_emb_mixer_layernorm=pre_emb_mixer_ln,
+                embedding_mixer=emb_mixer_spec,
+                emb_mixer_bda=emb_mixer_bda_spec,
                 sharded_state_dict_keys_map={
                     "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
                     "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
@@ -214,6 +220,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_te_activation_func: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    config: Optional['TransformerConfig'] = None,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -262,6 +269,11 @@ def get_gpt_layer_with_transformer_engine_spec(
         use_te_activation_func=use_te_activation_func,
     )
 
+    # Resolve embedding mixer spec from config (if provided and enabled).
+    emb_mixer_spec = _get_embedding_mixer_spec(config, backend) if config else IdentityOp
+    pre_emb_mixer_ln = backend.layer_norm() if isinstance(emb_mixer_spec, ModuleSpec) else IdentityOp
+    emb_mixer_bda_spec = get_bias_dropout_add if isinstance(emb_mixer_spec, ModuleSpec) else IdentityFuncOp
+
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         linear_q_up_proj = (
@@ -297,9 +309,9 @@ def get_gpt_layer_with_transformer_engine_spec(
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
-                pre_emb_mixer_layernorm=IdentityOp,
-                embedding_mixer=IdentityOp,
-                emb_mixer_bda=IdentityFuncOp,
+                pre_emb_mixer_layernorm=pre_emb_mixer_ln,
+                embedding_mixer=emb_mixer_spec,
+                emb_mixer_bda=emb_mixer_bda_spec,
             ),
         )
     else:
@@ -326,9 +338,9 @@ def get_gpt_layer_with_transformer_engine_spec(
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
-                pre_emb_mixer_layernorm=IdentityOp,
-                embedding_mixer=IdentityOp,
-                emb_mixer_bda=IdentityFuncOp,
+                pre_emb_mixer_layernorm=pre_emb_mixer_ln,
+                embedding_mixer=emb_mixer_spec,
+                emb_mixer_bda=emb_mixer_bda_spec,
                 sharded_state_dict_keys_map={
                     "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
                     "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
@@ -353,6 +365,7 @@ def get_gpt_layer_local_spec(
     use_kitchen: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    config: Optional['TransformerConfig'] = None,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -400,6 +413,11 @@ def get_gpt_layer_local_spec(
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
     )
 
+    # Resolve embedding mixer spec from config (if provided and enabled).
+    emb_mixer_spec = _get_embedding_mixer_spec(config, backend) if config else IdentityOp
+    pre_emb_mixer_ln = layer_norm if isinstance(emb_mixer_spec, ModuleSpec) else IdentityOp
+    emb_mixer_bda_spec = get_bias_dropout_add if isinstance(emb_mixer_spec, ModuleSpec) else IdentityFuncOp
+
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         return ModuleSpec(
@@ -425,9 +443,9 @@ def get_gpt_layer_local_spec(
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
-                pre_emb_mixer_layernorm=IdentityOp,
-                embedding_mixer=IdentityOp,
-                emb_mixer_bda=IdentityFuncOp,
+                pre_emb_mixer_layernorm=pre_emb_mixer_ln,
+                embedding_mixer=emb_mixer_spec,
+                emb_mixer_bda=emb_mixer_bda_spec,
             ),
         )
     else:
@@ -454,9 +472,9 @@ def get_gpt_layer_local_spec(
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
-                pre_emb_mixer_layernorm=IdentityOp,
-                embedding_mixer=IdentityOp,
-                emb_mixer_bda=IdentityFuncOp,
+                pre_emb_mixer_layernorm=pre_emb_mixer_ln,
+                embedding_mixer=emb_mixer_spec,
+                emb_mixer_bda=emb_mixer_bda_spec,
                 sharded_state_dict_keys_map={
                     "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
                     "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
@@ -557,6 +575,20 @@ def get_mlp_module_spec_for_backend(
         )
 
 
+def _get_layer_freq_pattern(freq, num_layers, name):
+    """Parse an int or list layer frequency into a per-layer 0/1 pattern."""
+    if isinstance(freq, int):
+        return [1 if (i % freq == 0) else 0 for i in range(num_layers)]
+    elif isinstance(freq, list):
+        assert len(freq) == num_layers, (
+            f"Invalid length of {name}: {len(freq)}, expected {num_layers}, "
+            f"current pattern: {freq}"
+        )
+        return freq
+    else:
+        raise ValueError(f"Invalid {name}: {type(freq)}, {freq}")
+
+
 def get_gpt_decoder_block_spec(
     config: TransformerConfig,
     use_transformer_engine: bool,
@@ -566,11 +598,23 @@ def get_gpt_decoder_block_spec(
     pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
+
+    # Determine whether any layer needs an embedding mixer.
+    emb_mixer_freq = config.embedding_mixer_layer_freq
+    emb_mixer_pattern = _get_layer_freq_pattern(
+        emb_mixer_freq, config.num_layers, "embedding_mixer_layer_freq"
+    )
+    need_mixer = any(p == 1 for p in emb_mixer_pattern) and (
+        config.embedding_mixer_latent_size is not None
+    )
+    need_no_mixer = any(p == 0 for p in emb_mixer_pattern) or not need_mixer
+
+    def _build_spec(spec_func, mixer_config, **kwargs):
+        return spec_func(**kwargs, config=mixer_config)
+
     if use_transformer_engine:
         layer_norm_impl = TENorm
-        dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=None,
-            moe_grouped_gemm=False,
+        common_te = dict(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
@@ -580,23 +624,16 @@ def get_gpt_decoder_block_spec(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
         )
-        moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        dense_kwargs = dict(num_experts=None, moe_grouped_gemm=False, **common_te)
+        moe_kwargs = dict(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
-            qk_layernorm=config.qk_layernorm,
-            multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
-            qk_l2_norm=qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-            use_te_activation_func=config.use_te_activation_func,
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
+            **common_te,
         )
+        spec_func = get_gpt_layer_with_transformer_engine_spec
     else:
         layer_norm_impl = LNImpl
-        dense_layer_spec = get_gpt_layer_local_spec(
-            num_experts=None,
-            moe_grouped_gemm=False,
+        common_local = dict(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
@@ -606,48 +643,46 @@ def get_gpt_decoder_block_spec(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
         )
-        moe_layer_spec = get_gpt_layer_local_spec(
+        dense_kwargs = dict(num_experts=None, moe_grouped_gemm=False, **common_local)
+        moe_kwargs = dict(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
-            qk_layernorm=config.qk_layernorm,
-            multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
-            normalization=normalization,
-            qk_l2_norm=qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
+            **common_local,
         )
+        spec_func = get_gpt_layer_local_spec
+
+    # Build up to 4 variants: {dense, moe} × {with_mixer, no_mixer}
+    # Only build variants that are actually needed.
+    dense_mixer = _build_spec(spec_func, config, **dense_kwargs) if need_mixer else None
+    dense_no_mixer = _build_spec(spec_func, None, **dense_kwargs) if need_no_mixer else None
+    moe_mixer = _build_spec(spec_func, config, **moe_kwargs) if need_mixer else None
+    moe_no_mixer = _build_spec(spec_func, None, **moe_kwargs) if need_no_mixer else None
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
     # 0 stands for dense layers, 1 stands for expert layers.
-    # For integer N: Creates a pattern with one expert layer every N layers.
-    # For string pattern: Evaluates the str directly (e.g. "[1,0,1]" for alternating expert/dense).
-    if isinstance(config.moe_layer_freq, int):
-        moe_layer_pattern = [
-            1 if (i % config.moe_layer_freq == 0) else 0 for i in range(config.num_layers)
-        ]
-    elif isinstance(config.moe_layer_freq, list):
-        moe_layer_pattern = config.moe_layer_freq
-        assert len(moe_layer_pattern) == config.num_layers, (
-            f"Invalid length of moe_layer_pattern: {len(moe_layer_pattern)}, "
-            f"expected {config.num_layers}, "
-            f"current moe layer pattern: {config.moe_layer_freq}"
-        )
-    else:
-        raise ValueError(
-            f"Invalid moe_layer_freq: {type(config.moe_layer_freq)}, {config.moe_layer_freq}"
-        )
+    moe_layer_pattern = _get_layer_freq_pattern(
+        config.moe_layer_freq, config.num_layers, "moe_layer_freq"
+    )
 
     # Create the layer specs for the model.
     layer_specs = []
     for layer_number in range(config.num_layers):
-        if moe_layer_pattern[layer_number] == 1:
-            layer_specs.append(moe_layer_spec)
-        elif moe_layer_pattern[layer_number] == 0:
-            layer_specs.append(dense_layer_spec)
+        is_moe = moe_layer_pattern[layer_number] == 1
+        has_mixer = need_mixer and emb_mixer_pattern[layer_number] == 1
+        if is_moe and has_mixer:
+            layer_specs.append(moe_mixer)
+        elif is_moe:
+            layer_specs.append(moe_no_mixer)
+        elif has_mixer:
+            layer_specs.append(dense_mixer)
+        elif not is_moe:
+            layer_specs.append(dense_no_mixer)
         else:
-            raise ValueError(f"Invalid layer pattern: {moe_layer_pattern}")
+            raise ValueError(
+                f"Invalid layer pattern at layer {layer_number}: "
+                f"moe={moe_layer_pattern[layer_number]}, "
+                f"mixer={emb_mixer_pattern[layer_number]}"
+            )
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
