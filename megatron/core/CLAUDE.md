@@ -1,215 +1,56 @@
-# CLAUDE.md - core
+# Core Library Guide
 
-> Part of [Megatron-LM](https://github.com/NVIDIA/Megatron-LM)
-> **Purpose**: Core library with GPU-optimized building blocks for distributed training
-> **Parent**: [../CLAUDE.md](../CLAUDE.md)
+> Covers: core patterns, tensor parallelism, pipeline parallelism, data parallelism, FSDP, optimizer, CUDA graphs
+> Parent: [../../CLAUDE.md](../../CLAUDE.md)
 
----
+## Key Patterns
 
-## Overview
+- **Config inheritance**: `ModelParallelConfig` → `TransformerConfig`. A single config object carries both model hyperparams (`hidden_size`) and parallelism topology (`tensor_model_parallel_size`). Callbacks (`grad_scale_func`, `no_sync_func`, `param_sync_func`) live on the config, making it a live communication broker.
+- **MegatronModule**: Base class for all distributed modules. Provides `state_dict_for_save_checkpoint()` and `sharded_state_dict()` for distributed checkpointing.
+- **parallel_state**: Singleton module managing all process groups. The rank ordering string (default `"tp-cp-ep-dp-pp"`) determines how global ranks map to groups. Changing this string produces completely different group memberships. EP and CP cannot both be >1 in the same `RankGenerator`.
+- **GlobalMemoryBuffer**: Must be initialized via `initialize_model_parallel()` before any collective ops use it.
 
-`megatron/core/` is the production-ready composable library that powers distributed large
-language model training. It provides modular building blocks (layers, optimizers, parallelism
-strategies) that work together to scale transformer training from 2B to 671B+ parameters.
+## CUDA Graphs
 
-**Problem Solved**: Scaling transformer training across multiple GPUs/nodes requires careful
-coordination of tensor parallelism (TP), pipeline parallelism (PP), data parallelism (DP),
-context parallelism (CP), and expert parallelism (EP). This directory abstracts these
-complexities into reusable components with a unified configuration-driven API.
+- Capture happens at the **end of the first training step**, in execution order recorded by `_CudagraphGlobalRecord`. All runners must register in the same order every step.
+- When `cuda_graph_use_single_mempool=True`, graphs sharing a pool must replay in capture order. Conditionally-skipped modules break this assumption.
+- GC is frozen during capture for PyTorch < 2.9 (`FREEZE_GC = True`).
+- After replay, `_CudaGraphRunner._run_bwd()` must restore `grad_added_to_main_grad` from a saved snapshot because GEMM kernels don't re-set this flag during replay.
+- CUDA graphs are incompatible with dynamic shapes — disable for variable-length or adaptive batching.
 
-**Key Concepts**:
-- **Parallelism-First**: All modules inherit `MegatronModule`, use `parallel_state` for
-  coordination
-- **Config-Driven**: Everything parameterized via dataclass configs (`TransformerConfig`,
-  `ModelParallelConfig`)
-- **Spec-Based Models**: Models built from `ModuleSpec` for easy layer customization
-- **Distributed Checkpointing**: State-dict agnostic checkpointing across arbitrary
-  parallelism configurations
-- **GPU-Optimized**: CUDA kernels (fusions), Transformer Engine (FP8), JAX-style FSDP
+## Tensor Parallelism & Sequence Parallelism
 
----
+- **Sequence parallelism reuses the TP group** — not a separate axis. With SP enabled, after `ColumnParallelLinear` it reduce-scatters (instead of all-gather), and before `RowParallelLinear` it all-gathers (instead of all-reduce). P2P tensor shapes in pipeline schedules divide `seq_len` by `tp_size` when SP is on.
+- `ColumnParallelLinear.gather_output`: set `True` if next layer expects replicated input; `False` only if next layer is `RowParallelLinear`. **Wrong setting = silent wrong results.**
+- `RowParallelLinear.input_is_parallel`: must match actual input distribution. **Mismatch = silent wrong results.**
+- `CudaRNGStatesTracker`: call `model_parallel_cuda_manual_seed()` **once at setup**, not per iteration. Required for dropout consistency across TP shards.
+- `VocabParallelEmbedding` + `vocab_parallel_cross_entropy()` must be used together — partial softmax requires both sides.
 
-## File Map
+## Pipeline Parallelism
 
-| File | Lines | Purpose | Key Exports |
-|------|-------|---------|-------------|
-| `parallel_state.py` | 2143 | Process group management (TP/PP/DP/CP/EP) | `initialize_model_parallel()`, `get_tensor_model_parallel_group()` |
-| `model_parallel_config.py` | - | Dataclass for all parallelism config | `ModelParallelConfig` |
-| `utils.py` | 2462 | Utilities (log, metrics, profiling) | `GlobalMemoryBuffer`, `print_rank_0()` |
-| `optimizer/distrib_optimizer.py` | 2603 | ZeRO-style distributed optimizer | `DistributedOptimizer` |
-| `optimizer/optimizer.py` | 1419 | Base optimizer wrapper | `MegatronOptimizer` |
-| `transformer/transformer_config.py` | 1857 | Transformer layer configuration | `TransformerConfig` |
-| `transformer/transformer_layer.py` | 1116 | Attention + MLP + LayerNorm | `TransformerLayer` |
-| `transformer/attention.py` | 1499 | Multi-head/GQA attention implementations | `ParallelAttention` |
-| `transformer/transformer_block.py` | 847 | Wrapper for transformer layer + residual | `TransformerBlock` |
-| `transformer/cuda_graphs.py` | 1976 | CUDA graph caching for inference | `CudaGraphBuilder` |
-| `tensor_parallel/layers.py` | 1315 | TP layers (Linear, Embedding) | `ColumnParallelLinear`, `RowParallelLinear` |
-| `tensor_parallel/mappings.py` | 596 | All-reduce, all-gather, reduce-scatter | `gather_from_tensor_model_parallel_region()` |
-| `tensor_parallel/random.py` | 688 | RNG seeding for TP | `CudaRNGStatesTracker` |
-| `pipeline_parallel/schedules.py` | 2306 | 1F1B, Interleaved schedules | `get_forward_backward_func()` |
-| `pipeline_parallel/p2p_communication.py` | 645 | Send/recv tensors across stages | `send_forward()`, `recv_forward()` |
-| `distributed/distributed_data_parallel.py` | 592 | DDP wrapper with grad sync | `DistributedDataParallel` |
-| `distributed/finalize_model_grads.py` | 488 | Allreduce gradients across DP ranks | `finalize_model_grads()` |
-| `datasets/gpt_dataset.py` | 882 | GPT-style dataset sampling | `GPTDataset` |
-| `datasets/indexed_dataset.py` | 1028 | Memory-mapped indexed data access | `IndexedDataset` |
-| `inference/inference_request.py` | 537 | Request queuing for batch inference | `InferenceRequest` |
-| `dist_checkpointing/mapping.py` | 559 | State-dict to shard mapping | `ShardedStateDict` |
-| `extensions/transformer_engine.py` | 2486 | Transformer Engine (FP8, fusions) | `TransformerEngineLayer` |
-| `extensions/kitchen.py` | 1808 | Kitchen Sink integration | `KitchenSinkLayer` |
-| `rerun_state_machine.py` | 1390 | Loss spike recovery via rerun | `RerunnableFunction` |
-| `timers.py` | 474 | Distributed timing metrics | `Timers` |
+- **Virtual pipeline backward reverses chunk order**: `get_model_chunk_id()` applies `num_model_chunks - id - 1`. Model chunks must be ordered consistently (chunk-0 first). Wrong order = wrong results with no error.
+- **Microbatches**: should be >= 2 * pipeline_size for optimal throughput. Too small = bubbles, too large = memory.
+- `deallocate_output_tensor()` replaces `.data` with a 1-element scalar (frees memory but keeps `.grad_fn`). `custom_backward()` calls C++ autograd engine directly because standard `.backward()` validates shapes.
+- `forward_step_func` must return `(output, loss_func)` tuple.
+- `BridgeCommunicator` required when crossing grid boundaries (e.g., TP=4/DP=2 to TP=2/DP=4).
+- **Hybrid CP schedule** (`hybrid_cp_schedule.py`): new in v0.16 — combines context parallelism with pipeline parallelism.
+- **Multimodule communicator** (`multimodule_communicator.py`): new in v0.16 — enables communication across independently-defined model modules in PP.
+- **Fine-grained activation offloading** (`fine_grained_activation_offload.py`): new in v0.16 — offloads specific activations to CPU during forward, reloads during backward.
 
----
+## Data Parallelism & Distributed
 
-## Architecture
+- **DistributedOptimizer partitioning does NOT respect parameter boundaries**. Each DP rank gets a contiguous slice of the flat gradient buffer that may split mid-parameter. Optimizer states are views into this buffer.
+- **DDP bucketing disabled on non-first PP stages** (`bucket_size=None`). Gradient overlap only functions for PP stage 0; other stages all-reduce synchronously. This is intentional.
+- **Gradient accumulation fusion**: when enabled, weight gradients accumulate directly into `param.main_grad` inside the GEMM kernel, bypassing `param.grad`. The `grad_added_to_main_grad` flag prevents double-addition.
+- Always **scale gradients before all-reduce** (not after) to avoid numerical overflow in FP8 mode.
+- **Megatron FSDP** is ~15% faster than PyTorch's (optimized collectives + FP8). Not compatible with PyTorch FSDP directly.
+- NCCL user buffers (`nccl_ub=True`): 10-20% speedup but requires `fsdp_double_buffer=True` and is incompatible with PyTorch `expandable_segments`.
+- **Embedding weight sync**: when `share_embeddings_and_output_weights=True`, embedding (PP stage 0) and output projection (last PP stage) sync via `_EMBEDDING_GROUP` all-reduce in `finalize_model_grads()`. New replicated params need `param.pipeline_parallel = True`.
 
-**Dependency Hierarchy** (bottom-up):
+## Optimizer
 
-```
-┌─────────────────────────────────────┐
-│ parallel_state (process groups)     │
-│ model_parallel_config (configs)     │
-└─────────────────────────────────────┘
-         ↓
-┌─────────────────────────────────────┐
-│ TP (tensor_parallel/)               │  Intra-node layer sharding
-│ DP (distributed/)                   │  Cross-device gradient sync
-│ PP (pipeline_parallel/)             │  Multi-stage communication
-└─────────────────────────────────────┘
-         ↓
-┌─────────────────────────────────────┐
-│ transformer/ (layers)               │  Attention, MLP, LayerNorm
-│ optimizer/ (distributed training)   │  Gradient aggregation, ZeRO
-│ datasets/ (data pipeline)           │  Sampling, preprocessing
-└─────────────────────────────────────┘
-         ↓
-┌─────────────────────────────────────┐
-│ models/ (GPT, BERT, Llama, etc)     │  Composed from specs
-│ inference/ (text generation)        │  Batched decoding
-│ dist_checkpointing/ (save/load)     │  Parallelism-agnostic format
-└─────────────────────────────────────┘
-```
-
-**Key Data Flows**:
-
-1. **Training Loop**: Data → Model (fwd) → Loss → Backward → Optimizer Step
-   - TP layers split weights across GPUs
-   - PP stages pipeline computation across nodes
-   - DP synchronizes gradients
-   - Optimizer aggregates to shared parameters
-
-2. **Inference**: Batch of requests → Cuda graphs (if enabled) → Attention/MLP →
-   KV-cache → Decode loop
-
-3. **Checkpointing**: Model state → ShardedStateDict → Distributed save/load →
-   Reshape to new parallelism config
-
----
-
-## Common Tasks
-
-### 1. Initialize Distributed Training
-
-```python
-from megatron.core import parallel_state, ModelParallelConfig
-
-config = ModelParallelConfig(
-    tensor_model_parallel_size=4,
-    pipeline_model_parallel_size=2,
-    context_parallel_size=1,
-    expert_model_parallel_size=1,
-)
-parallel_state.initialize_model_parallel(config)
-```
-
-### 2. Create a TP-enabled Layer
-
-```python
-from megatron.core.tensor_parallel import ColumnParallelLinear
-
-layer = ColumnParallelLinear(
-    input_size=4096, output_size=4096, bias=True,
-    parallel_state=parallel_state,
-)
-```
-
-### 3. Access Current Parallelism Context
-
-```python
-tp_rank = parallel_state.get_tensor_model_parallel_rank()
-pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-dp_rank = parallel_state.get_data_parallel_rank()
-```
-
-### 4. Build Model from Spec
-
-```python
-from megatron.core.models import GPTModel
-from megatron.core.transformer import ModuleSpec
-
-spec = ModuleSpec(
-    module_class=TransformerLayer,
-    module_config=TransformerConfig(...),
-)
-model = GPTModel(transformer_layer_spec=spec, vocab_size=50257)
-```
-
-### 5. Save/Load Distributed Checkpoint
-
-```python
-from megatron.core.dist_checkpointing import save, load
-
-save(model, optimizer, checkpoint_path)
-state = load(model, checkpoint_path)
-```
-
----
-
-## Dependencies
-
-**Depends On** (imports from):
-- `torch`, `torch.nn.parallel` - PyTorch core
-- `transformer_engine` (optional) - FP8 kernels, LayerNorm fusion
-- `flash-attn` (optional) - Flash attention backend
-- `jax.experimental.pjit` (optional) - FSDP alternative
-- `einops` - Tensor reshaping utilities
-
-**Used By** (imported by):
-- `megatron/training/` - Training scripts (main entry point)
-- `megatron/rl/` - RLHF, GRPO implementations
-- `megatron/post_training/` - Quantization, distillation
-- `examples/` - Training examples
-- Custom user models extending this library
-
----
-
-## Gotchas & Tips
-
-1. **Process Group Initialization**: Must call `initialize_model_parallel()` exactly once
-   before creating any distributed layers. Use `parallel_state.destroy_model_parallel()` in
-   tests to reset.
-
-2. **RNG Seeding**: TP requires a `CudaRNGStatesTracker` to ensure deterministic layer
-   behavior across tensor-parallel shards. Set seeds via `mpu.set_tensor_model_parallel_seed()`.
-
-3. **Gradient Aggregation**: DDP allreduce only happens between data-parallel replicas. If
-   using TP, gradients are already synchronized via backprop through sharded tensors.
-
-4. **Pipeline Bubbles**: PP introduces bubbles (idle GPUs). Use 1F1B schedule (default) for
-   optimal throughput on large models.
-
-5. **Checkpoint Compatibility**: ShardedStateDict format is independent of parallelism
-   config. You can train with TP=8, PP=1 then load into TP=4, PP=2.
-
-6. **Memory Profiling**: Use `utils.GlobalMemoryBuffer` to track peak allocated memory
-   across ranks.
-
----
-
-## See Also
-
-- `megatron/core/transformer/CLAUDE.md` - Attention, MLP, TransformerConfig details
-- `megatron/core/models/CLAUDE.md` - GPT, BERT, Llama architectures
-- `megatron/training/CLAUDE.md` - Training loop, arguments, initialization
-- `megatron/rl/CLAUDE.md` - RLHF, GRPO training
-- `MOE_TRAINING_GUIDE.md` - Mixture of Experts training
+- `DistributedOptimizer` requires DP > 1; single-GPU silently falls back to standard optimizer.
+- CPU offloading (`cpu_offload=True`) trades memory for compute — practical only for models > 200B.
+- Gradient clipping does AllReduce to compute global norm (~1-5% of step time).
+- **Muon optimizer** (`muon.py`): new in v0.16.
+- **Layer-wise optimizer** (`layer_wise_optimizer.py`): new in v0.16 — allows different optimizer configs per layer.
